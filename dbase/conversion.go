@@ -171,7 +171,7 @@ func sanitizeSpaces(str string) string {
 
 // nthBit returns the nth bit of a byte slice
 func getNthBit(bytes []byte, n int) bool {
-	if n > len(bytes)*8 {
+	if n < 0 || n >= len(bytes)*8 {
 		return false
 	}
 	byteIndex := n / 8 // byte index
