@@ -313,7 +313,18 @@ func (row *Row) ToBytes() ([]byte, error) {
 	// deleted flag already read
 	offset := uint16(1)
 	varPos := 0
-	nullFlag := make([]byte, 1)
+	// The null flag bitmap needs one bit per variable length column plus one
+	// additional bit per nullable column, so it can span multiple bytes.
+	var nullFlag []byte
+	if row.handle.nullFlagColumn != nil {
+		nullFlag = make([]byte, row.handle.nullFlagColumn.Length)
+	}
+	setNullFlagBit := func(pos int) {
+		for len(nullFlag)*8 <= pos {
+			nullFlag = append(nullFlag, 0x00)
+		}
+		nullFlag[pos/8] = setNthBit(nullFlag[pos/8], pos%8)
+	}
 	for _, field := range row.fields {
 		val, err := row.handle.Represent(field, false)
 		if err != nil {
@@ -321,28 +332,48 @@ func (row *Row) ToBytes() ([]byte, error) {
 		}
 		// Get null and length if variable length field
 		if field.column.DataType == byte(Varbinary) || field.column.DataType == byte(Varchar) {
+			nullable := field.column.Flag.Has(byte(NullableFlag))
+			// A nil value or an empty []byte is the null marker the read path
+			// produces, an empty string is a non-null empty value.
+			isNull := true
+			switch value := field.GetValue().(type) {
+			case string:
+				isNull = false
+			case []byte:
+				isNull = len(value) == 0
+			}
 			length := len(val)
-			// Not null and not full size
-			if length < int(field.column.Length) && length > 0 {
+			if isNull {
+				// Null markers carry no data bytes.
+				length = 0
+				val = nil
+			}
+			switch {
+			case isNull && nullable:
+				debugf("Variable length field %v is null", field.column.Name())
+				// The null bit directly follows the variable length bit and
+				// can cross a byte boundary of the bitmap.
+				setNullFlagBit(varPos + 1)
+			case length == 0:
+				// Empty non-null value or a null marker in a column without
+				// a null bit: store a zero length variable length value.
+				debugf("Variable length field %v is empty", field.column.Name())
+				setNullFlagBit(varPos)
+			case length < int(field.column.Length):
 				debugf("Variable length field %v is not null and not full size (%v < %v)", field.column.Name(), length, field.column.Length)
 				// Set last byte as length
 				buf := make([]byte, field.column.Length)
 				copy(buf, val)
 				buf[field.column.Length-1] = byte(length)
 				val = buf
-				// Set full size flag
-				byteIndex := varPos / 8
-				bitIndex := varPos % 8
-				nullFlag[byteIndex] = setNthBit(nullFlag[byteIndex], bitIndex)
-			} else if length == 0 { // Null
-				debugf("Variable length field %v is null", field.column.Name())
-				// Set null flag
-				byteIndex := varPos / 8
-				bitIndex := varPos % 8
-				nullFlag[byteIndex] = setNthBit(nullFlag[byteIndex], bitIndex+1)
+				// Set variable size flag
+				setNullFlagBit(varPos)
+			case length > int(field.column.Length):
+				return nil, NewErrorf("value of column field %v exceeds the column length (%d > %d)", field.column.Name(), length, field.column.Length)
 			}
 			// Increase variable field in nullFlag position, increase by one for length and another one for null flag
-			if field.column.Flag.Has(byte(NullableFlag)) {
+			varPos++
+			if nullable {
 				varPos++
 			}
 		}
@@ -602,6 +633,9 @@ func NewTable(version FileVersion, config *Config, columns []*Column, memoBlockS
 	// If there are nullable or variable length fields, add the null flag column
 	if nullFlagLength > 0 {
 		length := nullFlagLength / 8
+		if nullFlagLength%8 > 0 {
+			length++
+		}
 		file.nullFlagColumn = &Column{
 			FieldName: nullFlagColumn,
 			DataType:  0x30,
